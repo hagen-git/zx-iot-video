@@ -364,7 +364,7 @@ static bool zxsrv_respond_wifiscan(const char *dirpath, int offset){
 
 static bool zxsrv_videooptions(const char *name, int command){
 
-    /* if this is called with a nonzero cmd, we are reloading ans executing the issued command */
+    /* if this is called with a nonzero cmd, we are reloading and executing the issued command */
     if(command){
             ESP_LOGI(TAG, "zxsrv_videooptions: %d",command);
             switch(command){

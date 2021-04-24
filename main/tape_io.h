@@ -1,13 +1,10 @@
+#ifndef _TAPE_IO_H_
+#define _TAPE_IO_H_
+
 // holmatic
-
-
 
 // low-level functionality for transmitting (simultaneous RX/TX) computer tape signals per
 // one bit digitizer in the form of MSB-first byte-sized data. Transmission size can be determined in bits.
-// 
-
-#ifndef _TAPE_IO_H_
-#define _TAPE_IO_H_
 
 #include <esp_types.h>
 
@@ -15,18 +12,17 @@
 extern "C" {
 #endif
 
-
-#define  TAPIO_SAMPLE_SPEED_HZ  125000
+#define TAPIO_SAMPLE_SPEED_HZ 125000
 
 // buffer size in bytes for receive and transmit; multiple alternating sets are used so watch for mem consumption when increasing
-#define  TAPIO_MAX_TRANSFER_LEN_BYTES  (1024) 
+#define TAPIO_MAX_TRANSFER_LEN_BYTES (1024)
 
 // register function on init to be called back when data is received
-typedef void (*tapio_receive_callback_t)(uint8_t*, int);
+typedef void (*tapio_receive_callback_t)(uint8_t *, int);
 
 // call once at startup
 // callback(uint8_t* buffer, int size_in_bits)
-void tapio_init(tapio_receive_callback_t on_incomming_data);
+void tapio_init(tapio_receive_callback_t on_incoming_data);
 
 // wait until a tranfer ends if transfers still pending, callback may be triggered, return number of remaing active transfers
 int tapio_wait_and_finish_transfer();

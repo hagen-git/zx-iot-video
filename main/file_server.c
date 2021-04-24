@@ -101,9 +101,9 @@ static esp_err_t http_resp_dir_html(httpd_req_t *req, const char *dirpath)
     /* Send HTML file header */
    // httpd_resp_sendstr_chunk(req, "<!DOCTYPE html><html><body style=\"font-family:sans-serif;background-color:black;color:#4f8\">");
     
-    httpd_resp_sendstr_chunk(req, "<!DOCTYPE html><html> <style> body {font-family:sans-serif;background-color:#222;color:#4f8;} ");
+    httpd_resp_sendstr_chunk(req, "<!DOCTYPE html><html>\n<style> body {font-family:sans-serif;background-color:#222;color:#4f8;} ");
     httpd_resp_sendstr_chunk(req, "a:link {color:#4f8;} a:visited  {color:#4f8;} a:hover {color:#eee;} table { border-collapse: collapse; } ");
-    httpd_resp_sendstr_chunk(req, "</style> <body>");
+    httpd_resp_sendstr_chunk(req, "</style>\n<body>");
     vTaskDelay(1);
     /* Get handle to embedded file upload script */
     extern const unsigned char upload_script_start[] asm("_binary_upload_script_html_start");
@@ -115,10 +115,10 @@ static esp_err_t http_resp_dir_html(httpd_req_t *req, const char *dirpath)
 
     /* Send file-list table definition and column labels */
     httpd_resp_sendstr_chunk(req,
-        "<table class=\"fixed\" border=\"1\">"
-        "<col width=\"800px\" /><col width=\"300px\" /><col width=\"300px\" /><col width=\"100px\" />"
-        "<thead><tr><th>Name</th><th>Type</th><th>Size (Bytes)</th><th>Delete</th></tr></thead>"
-        "<tbody>");
+        "<table class=\"fixed\" border=\"1\">\n"
+        "<col width=\"600px\" /><col width=\"200px\" /><col width=\"200px\" /><col width=\"100px\" /><col width=\"100px\" />\n"
+        "<thead><tr><th>Name</th><th>Type</th><th>Size (Bytes)</th><th>Play</th><th>Delete</th></tr></thead>\n"
+        "<tbody>\n");
 
     /* Iterate over all files / folders and fetch their names and sizes */
     while ((entry = readdir(dir)) != NULL) {
@@ -141,13 +141,18 @@ static esp_err_t http_resp_dir_html(httpd_req_t *req, const char *dirpath)
         if (entry->d_type == DT_DIR) {
             httpd_resp_sendstr_chunk(req, "/");
         }
-//        httpd_resp_sendstr_chunk(req, "\" style=\"color: #6fa\" >");
+//      httpd_resp_sendstr_chunk(req, "\" style=\"color: #6fa\" >");
         httpd_resp_sendstr_chunk(req, "\" >");
         httpd_resp_sendstr_chunk(req, entry->d_name);
         httpd_resp_sendstr_chunk(req, "</a></td><td>");
         httpd_resp_sendstr_chunk(req, entrytype);
         httpd_resp_sendstr_chunk(req, "</td><td>");
         httpd_resp_sendstr_chunk(req, entrysize);
+        httpd_resp_sendstr_chunk(req, "</td><td>");
+        httpd_resp_sendstr_chunk(req, "<form method=\"post\" action=\"/play");
+        httpd_resp_sendstr_chunk(req, req->uri);
+        httpd_resp_sendstr_chunk(req, entry->d_name);
+        httpd_resp_sendstr_chunk(req, "\"><button type=\"submit\">Play</button></form>");
         httpd_resp_sendstr_chunk(req, "</td><td>");
         httpd_resp_sendstr_chunk(req, "<form method=\"post\" action=\"/delete");
         httpd_resp_sendstr_chunk(req, req->uri);
@@ -158,7 +163,7 @@ static esp_err_t http_resp_dir_html(httpd_req_t *req, const char *dirpath)
     closedir(dir);
 
     /* Finish the file list table */
-    httpd_resp_sendstr_chunk(req, "</tbody></table>");
+    httpd_resp_sendstr_chunk(req, "</tbody></table>\n");
 
 
     /* Add free space info -  TODO have more generic vfs method here? */
@@ -470,6 +475,47 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* Handler to play a file */
+static esp_err_t play_post_handler(httpd_req_t *req)
+{
+    char filepath[FILE_PATH_MAX];
+    struct stat file_stat;
+
+    /* Skip leading "/play" from URI to get filename */
+    /* Note sizeof() counts NULL termination hence the -1 */
+    const char *filename = get_path_from_uri(filepath, ((struct file_server_data *)req->user_ctx)->base_path,
+                                             req->uri  + sizeof("/play") - 1, sizeof(filepath));
+    if (!filename) {
+        /* Respond with 500 Internal Server Error */
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Filename too long");
+        return ESP_FAIL;
+    }
+
+    /* Filename cannot have a trailing '/' */
+    if (filename[strlen(filename) - 1] == '/') {
+        ESP_LOGE(TAG, "Invalid filename : %s", filename);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Invalid filename");
+        return ESP_FAIL;
+    }
+
+    if (stat(filepath, &file_stat) == -1) {
+        ESP_LOGE(TAG, "File does not exist : %s", filename);
+        /* Respond with 400 Bad Request */
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "File does not exist");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "Playing file : %s", filename);
+    /* Playback file */
+    //playback(filepath);
+
+    /* Redirect onto root to see the updated file list */
+    httpd_resp_set_status(req, "303 See Other");
+    httpd_resp_set_hdr(req, "Location", "/");
+    httpd_resp_sendstr(req, "File playback started");
+    return ESP_OK;
+}
+
 /* Handler to delete a file from the server */
 static esp_err_t delete_post_handler(httpd_req_t *req)
 {
@@ -568,6 +614,15 @@ esp_err_t start_file_server(const char *base_path)
         .user_ctx  = server_data    // Pass server data as context
     };
     httpd_register_uri_handler(server, &file_upload);
+
+    /* URI handler for uploading files to server */
+    httpd_uri_t file_play = {
+        .uri       = "/play/*",   // Match all URIs of type /play/path/to/file
+        .method    = HTTP_POST,
+        .handler   = play_post_handler,
+        .user_ctx  = server_data    // Pass server data as context
+    };
+    httpd_register_uri_handler(server, &file_play);
 
     /* URI handler for deleting files from server */
     httpd_uri_t file_delete = {
