@@ -1,11 +1,13 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "driver/i2s.h"  // TODO remove i2s_event_t
 #include "driver/spi_master.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_spi_flash.h"
+// File System Support
+//#include "esp_vfs.h"
+#include "esp_spiffs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -312,7 +314,7 @@ static void taps_task(void* arg) {
   //size_t buffered_file_count=0;
 
   while (true) {
-    /* receive only */
+    /* receive is the default task */
     tapio_clear_transmit_buffers();
     while (uxQueueMessagesWaiting(tx_cmd_queue) == 0) {
       tapio_process_next_transfer(0);
@@ -368,158 +370,332 @@ static void taps_task(void* arg) {
 #endif
 }
 
-#if 0
-
-
-static zxserv_evt_type_t phase=ZXSG_INIT;
-
-static const char* phasenames[]={"INIT","SLOW-50Hz","SLOW-60Hz","SAVE","SILENCE","HIGH","NOISE"};
-
-static void set_det_phase(zxserv_evt_type_t newphase)
-{
-	if(newphase!=phase){
-		phase=newphase;
-		zxsrv_send_msg_to_srv( newphase, 0,0);
-		ESP_LOGI(TAG,"Detected %s \n", phasenames[newphase-ZXSG_INIT]  );
-	}
-}
-#endif
+#define MAX_HEADER_BYTES 0x1B       // including hedaer type and checksum bytes
+#define TAPRF_BLOCK_TYPE_HEAD 0x00  // header block type
+#define TAPRF_BLOCK_TYPE_DATA 0xFF  // data block type
 
 typedef enum {
-  TAPRF_INIT = 0,          /*!< initial status */
-  TAPRF_HDR_STARTED = 1,   /*!< possibly receiving header */
-  TAPRF_HDR_RECEIVED = 2,  /*!< start retrieving file */
-  TAPRF_RETRIEVE_DATA = 3, /*!< during file transfer, check if ZX loads or ignores */
+  TAPRF_INIT = 0,        /*!< initial status */
+  TAPRF_PILOT1_STARTED,  /*!< possibly receiving pilot signal */
+  TAPRF_PILOT1_RECEIVED, /*!< pilot detected, wait for header */
+  TAPRF_RECEIVE_HEAD,    /*!< receive Jupiter Ace tape header block */
+  TAPRF_WAIT_DATA,       /*!< wait for data block pilot */
+  TAPRF_PILOT2_STARTED,  /*!< possibly receiving pilot signal */
+  TAPRF_PILOT2_RECEIVED, /*!< pilot detected, wait for data */
+  TAPRF_RECEIVE_DATA,    /*!< receive Jupiter Ace dictionary or binary data block */
+  TAPRF_MAX_STATUS
 } taprfs_state_t;
 
-typedef struct tap_rec_status_tag {
+typedef struct tap_rec_file {
   taprfs_state_t state;
   uint8_t bitcount;
-  uint8_t data;
+  uint8_t cur_byte;
+  uint8_t headcount;
+  uint8_t head[MAX_HEADER_BYTES];
+  uint16_t data_xlen;  //expected data length from header (plus two for block type and checksum)
+  uint8_t* data;
   uint16_t pulscount;
-  uint16_t e_line;
   uint16_t bytecount;
   uint16_t namelength;
-} tap_rec_status_t;
+} tap_rec_file_t;
 
-static tap_rec_status_t recfile;  // some signal statistics
-#if 1
+static tap_rec_file_t recfile;
+
+static void recfile_reset() {
+  if (recfile.data) {
+    free(recfile.data);
+  }
+  memset(&recfile, 0, sizeof(recfile));
+  recfile.state = TAPRF_INIT;  // PARANOIA
+}
 
 static void recfile_bit(uint8_t bitval) {
-  if (bitval)
-    recfile.data |= (0x80 >> recfile.bitcount);
-  if (++recfile.bitcount >= 8) {
-    // have a byte
-    if (recfile.bytecount % 1000 <= 40)
-      ESP_LOGI(TAG, "recfile byte %d data %02X", recfile.bytecount, recfile.data);
-    //        if(recfile.bytecount == recfile.namelength+16404-16393) recfile.e_line=recfile.data;
-    //       if(recfile.bytecount == recfile.namelength+16405-16393) {
-    //           recfile.e_line+=recfile.data<<8;
-    //          ESP_LOGI(TAG,"File E_LINE %d - len %d+%d\n",recfile.e_line,recfile.e_line-16393,recfile.namelength);
-    //     }
-    //	zxsrv_send_msg_to_srv( ZXSG_FILE_DATA, recfile.bytecount, recfile.data);
+  recfile.bitcount++;
+  recfile.cur_byte <<= 1;
+  recfile.cur_byte |= bitval;
+  if (recfile.bitcount < 8)
+    return;  // not a byte yet, done
 
-    recfile.bitcount = 0;
-    recfile.bytecount++;
-    // zx memory image is preceided by a name that end with the first inverse char (MSB set)
-    //   if (recfile.namelength==0 && (recfile.data&0x80) ) recfile.namelength=recfile.bytecount;
-    recfile.data = 0;
-    //   set_det_phase(ZXSG_SAVE);
-  }
-}
+  // Process the received byte.
 
-static void recfile_finalize() {
-  ESP_LOGI(TAG, "recfile finalize  %d bytes, %d bits", recfile.bytecount, recfile.bitcount);
-  recfile.state = TAPRF_INIT;
-}
+  // ZX81 memory image is preceded by a name that ends with the first inverse char (MSB set).
+  // Jupiter Ace has a header block and a data block. TAP format just glues both together.
+  // But I (Hagen) don't like the standard TAP format, because it omits the block type bytes (00/FF).
 
-#endif
+  // log the first (up to 41) received bytes of each 1000-byte block
+  if (recfile.bytecount % 1000 <= 40)
+    ESP_LOGI(TAG, "recfile byte %d data %02X", recfile.bytecount, recfile.cur_byte);
 
-static void rec_hdr_puls(uint32_t duration) {
-  if (recfile.state == TAPRF_INIT) {
-    recfile.pulscount = 0;
-    recfile.state = TAPRF_HDR_STARTED;
-  } else if (recfile.state == TAPRF_HDR_STARTED || recfile.state == TAPRF_HDR_RECEIVED) {
-    recfile.pulscount++;
-    if (recfile.pulscount == 256) { /* Jupiter Ace ROM requires 256 pulses, choose about the same here */
-      ESP_LOGW(TAG, "TAPRF_HDR_RECEIVED\n");
-      recfile.state = TAPRF_HDR_RECEIVED;
+  if (recfile.state == TAPRF_RECEIVE_HEAD) {
+    if (recfile.headcount < MAX_HEADER_BYTES) {
+      if (recfile.headcount == 0 && recfile.cur_byte != TAPRF_BLOCK_TYPE_HEAD) {
+        ESP_LOGW(TAG, "HEADER block incorrect block type 0x%02x. RESET.\n", recfile.cur_byte);
+        recfile_reset();
+      }
+      recfile.head[recfile.headcount] = recfile.cur_byte;
+      recfile.headcount++;
+    } else {
+      ESP_LOGW(TAG, "HEADER block too long, additional data ingored.\n");
     }
-    //	} else if (recfile.state==TAPRF_RETRIEVE_DATA){
-    //		recfile_bit(1);
-  } else if (recfile.state == TAPRF_RETRIEVE_DATA) {
-    ESP_LOGW(TAG, "Follow-up Header %d %d ", recfile.bitcount, recfile.bytecount);
-    recfile_finalize();
-    recfile.pulscount = 0;
-    recfile.state = TAPRF_HDR_STARTED;
+  } else if (recfile.state == TAPRF_RECEIVE_DATA) {
+    if (!recfile.data) {
+      ESP_LOGW(TAG, "RESET because data block not allocated.\n");
+      recfile_reset();
+      return;
+    }
+    if (recfile.bytecount < recfile.data_xlen) {
+      if (recfile.bytecount == 0 && recfile.cur_byte != TAPRF_BLOCK_TYPE_DATA) {
+        ESP_LOGW(TAG, "DATA block incorrect block type 0x%02x. RESET.\n", recfile.cur_byte);
+        recfile_reset();
+        return;
+      }
+      recfile.data[recfile.bytecount] = recfile.cur_byte;
+    } else {
+      ESP_LOGW(TAG, "DATA block too long, additional data ignored.\n");
+    }
+  }
+  recfile.bytecount++;
+
+  //   if (recfile.namelength==0 && (recfile.data&0x80) ) recfile.namelength=recfile.bytecount;
+  recfile.bitcount = 0;
+  recfile.cur_byte = 0;
+}
+
+/* Jupiter Ace Header format
+
+	Ofs	Len	Description
+	0	1	block type 0x00 for header
+	1	1	file type: 0x00 for Dictionary, 0x20 for bytes file (anything non-zero is fine)
+	2	10	filename (ASCII), padded with spaces (0x20)
+	12	2	length of file
+	14	2	start address, a Dictionary starts at 15441/0x3C51
+	16	2	current word. Unused for bytes file, i.e. 8224/0x2020
+	18	2	value of system var CURRENT [Address 15409/0x3C31]. Unused* for bytes file
+	20	2	value of system var CONTEXT [Address 15411/0x3C33]. Unused* for bytes file
+	22	2	value of system var VOCLNK  [Address 15413/0x3C35]. Unused* for bytes file
+	24	2	value of system var STKBOT  [Address 15415/0x3C37]. Unused* for bytes file
+	26	1	XOR checksum of all bytes from 1 to 25
+
+	Total length: 27/0x1B bytes including block type and checksum
+*/
+static void recfile_proc_header() {
+  ESP_LOGI(TAG, "HEADER processing %d bytes, %d bits", recfile.headcount, recfile.bitcount);
+  if (recfile.namelength) {
+    ESP_LOGW(TAG, "HEADER processing duplicate call");
+    return;
+  }
+  {  // Compute name length
+    int cnt = 0;
+    while (cnt < 10 && recfile.head[2 + cnt] > 0x20)
+      cnt++;
+    recfile.namelength = cnt;
+    if (!cnt) {
+      ESP_LOGW(TAG, "HEADER processing: empty file name.");
+    }
+  }
+  // Compute expected data length (inclusive block type and checksum)
+  recfile.data_xlen = 2 + (recfile.head[12] | (recfile.head[13] << 8));
+  // Allocate memory for data file
+  recfile.data = (uint8_t*)malloc(recfile.data_xlen);
+  if (recfile.data) {
+    recfile.state = TAPRF_WAIT_DATA;
+    recfile.bytecount = 0;  // reset byte count for data
+    return;
+  }
+  ESP_LOGW(TAG, "HEADER processing: malloc for %d bytes failed. RESET.", recfile.data_xlen);
+  recfile_reset();
+}
+
+#define SPIFFS_ACE_FILENAME_MAX 50
+static void recfile_finalize() {
+  ESP_LOGI(TAG, "DATA processing %d bytes, %d bits", recfile.headcount, recfile.bitcount);
+  if (!recfile.namelength) {
+    ESP_LOGW(TAG, "DATA processing duplicate call?");
+    return;
+  }
+  FILE* fd = NULL;
+  char filepath[SPIFFS_ACE_FILENAME_MAX];
+  const char fp_prefix[] = { '/', 's', 'p', 'i', 'f', 'f', 's', '/'};
+  const char ext[] = {'.', 't', 'z', 'x', (char)0};
+  const char tzx_header[] = {'Z', 'X', 'T', 'a', 'p', 'e', '!', (char)0x1A, (char)0x01, (char)0x0d};
+  const char txt_wespi[] = {'R', 'e', 'c', ':', 'Z', 'X', '-', 'W', 'e', 's', 'p', 'i',
+                            '-', 'V', '-', 'A', 'c', 'e'};
+  // Make a Spiffs and TZX file name
+  int pos = 0;
+  int len = sizeof(fp_prefix);
+  memcpy(&filepath[pos], &fp_prefix, len);
+  pos += len;
+  len = recfile.namelength;
+  memcpy(&filepath[pos], &recfile.head[2], len);
+  pos += len;
+  len = sizeof(ext);
+  memcpy(&filepath[pos], &ext, len);
+  ESP_LOGI(TAG, "recfile finalize '%s', HEAD %d bytes, DATA %d bytes", filepath, recfile.headcount, recfile.bytecount);
+  // Save header and data blocks as TZX file in mass storage
+  fd = fopen(filepath, "w");
+  if (fd) {
+    fwrite(tzx_header, sizeof(tzx_header), 1, fd);
+    fputc(0x10, fd);                                 // TZX Standard Speed Data Block
+    fputc(0xE8, fd);                                 // 1000ms (0x03E8) pause after header block
+    fputc(0x03, fd);                                 // pause high byte
+    fputc(recfile.headcount & 0xFF, fd);             // length low byte
+    fputc((recfile.headcount >> 8) & 0xFF, fd);      // length high byte
+    fwrite(recfile.head, recfile.headcount, 1, fd);  // tape header, including block type and checksum
+    fputc(0x10, fd);                                 // TZX Standard Speed Data Block
+    fputc(0xB8, fd);                                 // 3000ms (0x0BB8) pause after data block
+    fputc(0x0B, fd);                                 // pause high byte
+    fputc(recfile.data_xlen & 0xFF, fd);             // length low byte
+    fputc((recfile.data_xlen >> 8) & 0xFF, fd);      // length high byte
+    fwrite(recfile.data, recfile.data_xlen, 1, fd);  // tape data, including block type and checksum
+    fputc(0x30, fd);                                 // TZX Text description
+    fputc(sizeof(txt_wespi), fd);                    // length of block
+    fwrite(txt_wespi, sizeof(txt_wespi), 1, fd);     // text description
+    fclose(fd);
   } else {
-    ESP_LOGW(TAG, "unknown HDR puls ");
-    recfile.state = TAPRF_INIT;
+    ESP_LOGE(TAG, "Failed to create file : %s", filepath);
+  }
+  // Ready to receive next file
+  recfile_reset();
+}
+
+static void rec_pilot_pulse(uint32_t duration) {
+  switch (recfile.state) {
+    case TAPRF_INIT: {
+      recfile.pulscount = 0;
+      recfile.state = TAPRF_PILOT1_STARTED;
+    } break;
+    case TAPRF_WAIT_DATA: {
+      recfile.pulscount = 0;
+      recfile.state = TAPRF_PILOT2_STARTED;
+    } break;
+    case TAPRF_PILOT1_STARTED: {
+      recfile.pulscount++;
+      if (recfile.pulscount == 256) { /* Jupiter Ace ROM requires 256 pulses, choose about the same here */
+        ESP_LOGW(TAG, "TAPRF_PILOT1_RECEIVED\n");
+        recfile.state = TAPRF_PILOT1_RECEIVED;
+      }
+    } break;
+    case TAPRF_PILOT2_STARTED: {
+      recfile.pulscount++;
+      if (recfile.pulscount == 256) { /* Jupiter Ace ROM requires 256 pulses, choose about the same here */
+        ESP_LOGW(TAG, "TAPRF_PILOT2_RECEIVED\n");
+        recfile.state = TAPRF_PILOT2_RECEIVED;
+      }
+    } break;
+    case TAPRF_PILOT1_RECEIVED: {
+      recfile.pulscount++;  // waiting for header
+    } break;
+    case TAPRF_PILOT2_RECEIVED: {
+      recfile.pulscount++;  // waiting for data
+    } break;
+    case TAPRF_RECEIVE_HEAD: {
+      ESP_LOGI(TAG, "Follow-up impulse after HEAD %d %d ", recfile.bitcount, recfile.bytecount);
+      recfile_proc_header();
+    } break;
+    case TAPRF_RECEIVE_DATA: {
+      ESP_LOGI(TAG, "Follow-up impulse after DATA %d %d ", recfile.bitcount, recfile.bytecount);
+      recfile_finalize();
+    } break;
+    default: {
+      ESP_LOGW(TAG, "RESET: unknown pulse type / status\n");
+      recfile_reset();
+    }
   }
 }
 
-static void rec_0_puls() {
-  if (recfile.state == TAPRF_HDR_RECEIVED) {
-    ESP_LOGW(TAG, "TAPRF_RETRIEVE_DATA0\n");
-    recfile.state = TAPRF_RETRIEVE_DATA;
-    recfile.bytecount = 0;
-    recfile.bitcount = 0;
-    recfile.data = 0;
-  } else if (recfile.state == TAPRF_RETRIEVE_DATA) {
-    recfile_bit(0);
-  } else {
-    ESP_LOGW(TAG, "unknown 0 puls ");
-    recfile.state = TAPRF_INIT;
+static void rec_0_pulse() {
+  // The SYNC pulse is about as long as a '0' bit.
+  switch (recfile.state) {
+    case TAPRF_PILOT1_RECEIVED: {
+      ESP_LOGW(TAG, "TAPRF_RECEIVE_HEAD\n");
+      recfile.state = TAPRF_RECEIVE_HEAD;
+      recfile.bytecount = 0;
+      recfile.bitcount = 0;
+      recfile.cur_byte = 0;
+    } break;
+    case TAPRF_PILOT2_RECEIVED: {
+      ESP_LOGW(TAG, "TAPRF_RECEIVE_DATA\n");
+      recfile.state = TAPRF_RECEIVE_DATA;
+      recfile.bytecount = 0;
+      recfile.bitcount = 0;
+      recfile.cur_byte = 0;
+    } break;
+    case TAPRF_RECEIVE_HEAD: {
+      recfile_bit(0);
+    } break;
+    case TAPRF_RECEIVE_DATA: {
+      recfile_bit(0);
+    } break;
+    default: {
+      ESP_LOGW(TAG, "RESET after unexpected 0 pulse\n");
+      recfile_reset();
+    }
   }
 }
 
-static void rec_1_puls(uint32_t duration) {
-  if (recfile.state == TAPRF_HDR_STARTED || recfile.state == TAPRF_HDR_RECEIVED) {
-    ESP_LOGW(TAG, "rec_1_puls during HDR %d us", SAMPLES_to_USEC(duration));
-  } else if (recfile.state == TAPRF_RETRIEVE_DATA) {
-    recfile_bit(1);
-  } else {
-    ESP_LOGW(TAG, "unknown 1 puls ");
-    recfile.state = TAPRF_INIT;
+static void rec_1_pulse(uint32_t duration) {
+  switch (recfile.state) {
+    case TAPRF_PILOT1_STARTED:
+    case TAPRF_PILOT1_RECEIVED:
+    case TAPRF_PILOT2_STARTED:
+    case TAPRF_PILOT2_RECEIVED: {
+      ESP_LOGW(TAG, "rec_1_pulse during PILOT %d us", SAMPLES_to_USEC(duration));
+    } break;
+    case TAPRF_RECEIVE_HEAD: {
+      recfile_bit(1);
+    } break;
+    case TAPRF_RECEIVE_DATA: {
+      recfile_bit(1);
+    } break;
+    default:
+      ESP_LOGW(TAG, "RESET after unexpected 1 pulse\n");
+      recfile_reset();
   }
 }
 
-static void rec_noise_puls() {
-  if (recfile.state != TAPRF_INIT) {
-    ESP_LOGW(TAG, "RESET after noise pulse\n");
+static void rec_noise_pulse() {
+  if (recfile.state != TAPRF_INIT && recfile.state != TAPRF_WAIT_DATA) {
+    ESP_LOGW(TAG, "RESET after unexpected noise pulse\n");
+    recfile_reset();
   }
-  recfile.state = TAPRF_INIT;
 }
 
-static bool current_logic_level = 0;
+static bool current_logic_level = false;
 static uint32_t level_cnt = 0;
-static uint32_t puls_cnt = 0;
+static uint32_t pulse_cnt = 0;
 
 static void analyze_1_to_0(uint32_t duration) {
   // end of high phase,  245 for 0 , 488 for 1 , or 618us for pilot, 277 for end mark, 1.288 for gap
   if (duration < USEC_TO_SAMPLES(150))
-    rec_noise_puls();
+    rec_noise_pulse();
   else if (duration <= USEC_TO_SAMPLES(350))
-    rec_0_puls();
+    rec_0_pulse();
   else if (duration <= USEC_TO_SAMPLES(550))
-    rec_1_puls(duration);
+    rec_1_pulse(duration);
   else if (duration <= USEC_TO_SAMPLES(680))
-    rec_hdr_puls(duration);
+    rec_pilot_pulse(duration);
+  // else might be pause
 
-  if (duration < 2 || duration > 500 || (puls_cnt & 0x1ff) < 5)
+  if (duration < 2 || duration > 500 || (pulse_cnt & 0x1ff) < 5)
     ESP_LOGW(TAG, "High pulse %d smpls, %d us", duration, SAMPLES_to_USEC(duration));
 
-  puls_cnt++;
+  pulse_cnt++;
 }
 
 static void check_on_const_level() {
-  if (recfile.state != TAPRF_INIT && level_cnt > USEC_TO_SAMPLES(3000)) {
-    if (recfile.state == TAPRF_RETRIEVE_DATA)
-      recfile_finalize();
-    else {
-      ESP_LOGW(TAG, "RESET after silence\n");
-    }
-    recfile.state = TAPRF_INIT;
+  if (level_cnt < USEC_TO_SAMPLES(3000))
+    return;
+  if (recfile.state == TAPRF_INIT)
+    return;
+  if (recfile.state == TAPRF_WAIT_DATA)
+    return;
+  if (recfile.state == TAPRF_RECEIVE_HEAD) {
+    recfile_proc_header();
+  } else if (recfile.state == TAPRF_RECEIVE_DATA) {
+    recfile_finalize();
+  } else {
+    ESP_LOGW(TAG, "RESET after unexpected silence\n");
+    recfile_reset();
   }
 }
 
@@ -567,7 +743,7 @@ static void on_rx_data(uint8_t* data, int size_bits) {
   ESP_LOGD(TAG, "on_rx_data %d bits", size_bits);
   acc_kbytes += size_bits / 8192;
   if ((acc_kbytes & 0xff) == 0)
-    ESP_LOGW(TAG, "on_rx_data acc %d Mbytes %x, plscnt=%d ", acc_kbytes / 1024, data[0], puls_cnt);
+    ESP_LOGW(TAG, "on_rx_data acc %d Mbytes %x, plscnt=%d ", acc_kbytes / 1024, data[0], pulse_cnt);
   // check for all-0 here as this is usually the case
   if (level_cnt > USEC_TO_SAMPLES(2500) && !current_logic_level) {
     for (int i = 0; i < size_bits / 8; i++) {
